@@ -19,11 +19,73 @@ from typing import NamedTuple
 MAX_COUNT = (1 << 64) - 1          # counts / totals may reach 2^64 - 1
 MAX_INT64 = (1 << 63) - 1          # ts / revision / cut points
 
-TOOL_VERSION = "1.1.0"
+TOOL_VERSION = "1.2.0"
 
 
 class HistowareError(Exception):
     """Base class for user-facing errors."""
+
+
+class RetiredVersionError(HistowareError):
+    """A warehouse version is no longer replayable under the retention
+    policy.  Deliberately distinct from generic summary errors so that a
+    caller can tell "this version was retired" from "this version is
+    missing or incomplete"."""
+
+    def __init__(self, version: int, watermark: int, policy_generation: int):
+        super().__init__(
+            f"warehouse version {version} has been retired by retention"
+            f" policy (watermark {watermark}, policy generation"
+            f" {policy_generation})")
+        self.version = version
+        self.watermark = watermark
+        self.policy_generation = policy_generation
+
+
+# ---------------------------------------------------------------------------
+# Canonical payload encoding
+# ---------------------------------------------------------------------------
+# The canonical encoding of one checkpoint payload is the UTF-8 JSON
+# object with keys in this exact order, no whitespace, ASCII-escaped
+# strings, decimal integers, and the stored canonical JSON arrays for
+# cuts/counts:
+#
+#   {"collector":...,"counts":[...],"cuts_ms":[...],"generation":...,
+#    "region":...,"revision":...,"total":...,"ts":...}
+#
+# `cuts`/`counts` passed in must already be the canonical compact JSON
+# arrays produced by `Checkpoint` (and stored in the warehouse).  This
+# encoding is the contract for "normalised payload bytes" in retirement
+# plans and receipts; it is never the SQLite page or file size.
+
+def _canon_str(value: str) -> str:
+    return json.dumps(value, ensure_ascii=True, separators=(",", ":"))
+
+
+def canonical_payload_bytes(region, collector, generation, ts, revision,
+                            cuts_json, counts_json, total_str) -> bytes:
+    text = (
+        '{"collector":%s,"counts":%s,"cuts_ms":%s,"generation":%s,'
+        '"region":%s,"revision":%d,"total":%s,"ts":%d}'
+        % (_canon_str(collector), counts_json, cuts_json,
+           _canon_str(generation), _canon_str(region),
+           int(revision), str(total_str), int(ts)))
+    return text.encode("utf-8")
+
+
+def payload_sha256(region, collector, generation, ts, revision,
+                   cuts_json, counts_json, total_str) -> str:
+    import hashlib
+    return hashlib.sha256(
+        canonical_payload_bytes(region, collector, generation, ts, revision,
+                                cuts_json, counts_json, total_str)
+    ).hexdigest()
+
+
+def canonical_json(obj) -> str:
+    """Deterministic JSON used for plan identifiers and stored plans."""
+    return json.dumps(obj, sort_keys=True, ensure_ascii=True,
+                      separators=(",", ":"))
 
 
 class LineError(HistowareError):

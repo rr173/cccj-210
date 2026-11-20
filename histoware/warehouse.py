@@ -1,9 +1,12 @@
-"""Warehouse storage and batch loading.
+"""Warehouse storage, batch loading and retention management.
 
 Schema
 ------
 meta(key, value)
     'current_version': the visible warehouse version (0 = empty).
+    Retention keys (only in an explicitly initialised managed
+    warehouse, see below): 'warehouse_id', 'retention_watermark',
+    'policy_generation', 'policy_gc', 'schema_version'.
 batch(batch_id, file_sha256, version, loaded_at, rows)
     One row per committed batch.  Used for idempotent re-sends.
 checkpoint(region, collector, generation, ts, revision,
@@ -12,6 +15,16 @@ checkpoint(region, collector, generation, ts, revision,
     arrays, `total` is decimal TEXT (counts/totals may reach 2**64-1,
     which does not fit a SQLite signed 64-bit INTEGER).  `version` is
     the warehouse version that introduced the row.
+receipt(...)
+    Minimal acceptance credentials for revisions whose payload has
+    been evicted, plus retirement receipts.  An evicted revision is
+    recognised as an equivalent retransmission (same identity, same
+    first version/provenance, same canonical-content SHA-256) without
+    keeping the payload; differing content is still rejected with the
+    original provenance.
+retention_plan(...)
+    Persisted rehearsal plans (immutable: a plan's stored body and its
+    plan id cannot be changed without detection).
 
 Indexes
 -------
@@ -20,6 +33,15 @@ revision) doubles as the endpoint-lookup index: all revisions of one
 checkpoint point are consecutive and ordered by revision, so
 "max revision with version <= V" is an O(log n) index probe and never
 a scan of the checkpoint history.
+
+Retention
+---------
+A warehouse becomes *managed* only through ``init_retention`` (the
+``retire init`` command): it records a stable warehouse identifier, a
+watermark of 0, no exceptions and policy generation 0.  Initialising an
+already managed warehouse is a no-op (it never resets state or the
+identifier); an uninitialised warehouse keeps behaving exactly as
+before, with no retention filtering at all.
 
 Loading
 -------
@@ -31,15 +53,18 @@ single BEGIN IMMEDIATE transaction validate it against existing data
 and commit every row plus the version bump.  Any bad line, intra-batch
 or cross-batch conflict, or read failure therefore leaves the visible
 version untouched, and all historical versions remain recomputable.
+A retransmission of an evicted revision is validated against its
+acceptance receipt, and never resurrects the evicted payload row.
 """
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import sqlite3
 from datetime import datetime, timezone
 
-from .common import HistowareError, parse_checkpoint
+from .common import (HistowareError, parse_checkpoint, payload_sha256)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta(
@@ -67,7 +92,45 @@ CREATE TABLE IF NOT EXISTS checkpoint(
   version    INTEGER NOT NULL,
   PRIMARY KEY(region, collector, generation, ts, revision)
 );
+CREATE TABLE IF NOT EXISTS receipt(
+  id                INTEGER PRIMARY KEY,
+  kind              TEXT NOT NULL
+                    CHECK(kind IN ('content','retirement')),
+  warehouse_id      TEXT,
+  region            TEXT,
+  collector         TEXT,
+  generation        TEXT,
+  ts                INTEGER,
+  revision          INTEGER,
+  first_batch       TEXT,
+  first_line        INTEGER,
+  first_version     INTEGER,
+  content_sha256    TEXT,
+  content_bytes     INTEGER,
+  plan_id           TEXT,
+  base_version      INTEGER,
+  evicted_rows      INTEGER,
+  evicted_bytes     INTEGER,
+  policy_generation INTEGER,
+  detail_json       TEXT,
+  created_utc       TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_receipt_content
+  ON receipt(region, collector, generation, ts, revision)
+  WHERE kind = 'content';
+CREATE UNIQUE INDEX IF NOT EXISTS ux_receipt_plan
+  ON receipt(plan_id) WHERE kind = 'retirement';
 """
+
+# Keys that mark a warehouse as explicitly managed.  Absence of
+# 'warehouse_id' means "legacy warehouse": no retention behaviour.
+META_WAREHOUSE_ID = "warehouse_id"
+META_WATERMARK = "retention_watermark"
+META_POLICY_GEN = "policy_generation"
+META_POLICY_GC = "policy_gc"
+META_SCHEMA_VERSION = "schema_version"
+
+RETENTION_SCHEMA_VERSION = "2"
 
 _STAGE_COLUMNS = "region, collector, generation, ts, revision, cuts, counts, total, line_no"
 _STAGE_SQL = f"INSERT INTO stage({_STAGE_COLUMNS}) VALUES (?,?,?,?,?,?,?,?,?)"
@@ -88,18 +151,62 @@ def connect_warehouse(path, create=False):
     conn = sqlite3.connect(path, isolation_level=None)
     conn.execute("PRAGMA busy_timeout = 30000")
     if create:
-        conn.execute("PRAGMA journal_mode = WAL")
+        # Several processes/threads may race to initialise the same new
+        # file.  Switching the journal mode needs an exclusive lock and
+        # does not always honour busy_timeout; retry briefly instead of
+        # surfacing a spurious "database is locked".
+        _retry_locked(lambda: conn.execute("PRAGMA journal_mode = WAL"))
         conn.execute("PRAGMA temp_store = 1")   # file-backed temp tables
-        conn.executescript(SCHEMA)
+        _retry_locked(lambda: conn.executescript(SCHEMA))
         conn.execute(
             "INSERT OR IGNORE INTO meta(key, value) VALUES('current_version', '0')")
     return conn
+
+
+def _retry_locked(fn, attempts=200, delay=0.01):
+    import time
+    for i in range(attempts):
+        try:
+            return fn()
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc) and "busy" not in str(exc):
+                raise
+            if i == attempts - 1:
+                raise
+            time.sleep(delay)
 
 
 def get_current_version(conn) -> int:
     row = conn.execute(
         "SELECT value FROM meta WHERE key = 'current_version'").fetchone()
     return int(row[0]) if row else 0
+
+
+def get_meta(conn, key, default=None):
+    row = conn.execute("SELECT value FROM meta WHERE key = ?",
+                       (key,)).fetchone()
+    return row[0] if row else default
+
+
+def is_managed(conn) -> bool:
+    """True only for an explicitly initialised (retention-managed) warehouse."""
+    return get_meta(conn, META_WAREHOUSE_ID) is not None
+
+
+def read_policy(conn) -> dict:
+    """Current retention policy.  Legacy warehouses read as watermark 0,
+    no exceptions and policy generation 0, but remain unmanaged."""
+    wid = get_meta(conn, META_WAREHOUSE_ID)
+    gc = json.loads(get_meta(conn, META_POLICY_GC, "{}"))
+    return {
+        "managed": wid is not None,
+        "warehouse_id": wid,
+        "watermark": int(get_meta(conn, META_WATERMARK, "0")),
+        "exceptions": [{"work_order": name, "version": int(version)}
+                       for name, version in sorted(gc.items())],
+        "policy_generation": int(get_meta(conn, META_POLICY_GEN, "0")),
+        "schema_version": get_meta(conn, META_SCHEMA_VERSION),
+    }
 
 
 def _utcnow() -> str:
@@ -162,7 +269,8 @@ def load_batch(db_path, batch_id, stream) -> dict:
                 conn.execute("ROLLBACK")
                 return {"batch": batch_id, "version": row[1], "reused": True,
                         "lines": n_lines, "new_checkpoints": 0,
-                        "duplicate_checkpoints": 0}
+                        "duplicate_checkpoints": 0,
+                        "retransmitted_evicted": 0}
 
             # Collapse identical retransmissions inside the batch,
             # keeping the first line number.
@@ -194,6 +302,13 @@ def load_batch(db_path, batch_id, stream) -> dict:
                     "checkpoint region={!r} collector={!r} generation={!r} "
                     "ts={} revision={} conflicts with the revision already "
                     "loaded by batch {!r} line {}".format(*bad))
+            # Revisions whose payload was evicted keep only an acceptance
+            # receipt.  An equivalent retransmission is a duplicate and
+            # must never resurrect the row; differing content is rejected
+            # while naming its first provenance.
+            conflicts = _check_evicted_retransmissions(conn)
+            if conflicts is not None:
+                raise BatchError(conflicts)
             total_staged = conn.execute(
                 "SELECT COUNT(*) FROM stage_dedup").fetchone()[0]
             version = get_current_version(conn) + 1
@@ -204,9 +319,22 @@ def load_batch(db_path, batch_id, stream) -> dict:
                 "        s.revision, s.cuts, s.counts, s.total, ?, s.line_no, ?"
                 " FROM stage_dedup s"
                 " WHERE NOT EXISTS(SELECT 1 FROM checkpoint p WHERE "
-                + _KEY_JOIN + ")",
+                + _KEY_JOIN + ")"
+                "   AND NOT EXISTS(SELECT 1 FROM receipt r WHERE "
+                " r.kind = 'content' AND r.region = s.region"
+                " AND r.collector = s.collector"
+                " AND r.generation = s.generation AND r.ts = s.ts"
+                " AND r.revision = s.revision)",
                 (batch_id, version))
             new_rows = cur.rowcount
+            retransmitted = conn.execute(
+                "SELECT COUNT(*) FROM stage_dedup s JOIN receipt r"
+                " ON r.kind = 'content' AND r.region = s.region"
+                " AND r.collector = s.collector"
+                " AND r.generation = s.generation AND r.ts = s.ts"
+                " AND r.revision = s.revision"
+                " WHERE NOT EXISTS(SELECT 1 FROM checkpoint p WHERE "
+                + _KEY_JOIN + ")").fetchone()[0]
             conn.execute(
                 "INSERT INTO batch(batch_id, file_sha256, version, loaded_at,"
                 " rows) VALUES (?,?,?,?,?)",
@@ -221,10 +349,46 @@ def load_batch(db_path, batch_id, stream) -> dict:
             raise
         return {"batch": batch_id, "version": version, "reused": False,
                 "lines": n_lines, "new_checkpoints": new_rows,
-                "duplicate_checkpoints": total_staged - new_rows,
-                "intra_batch_duplicates": n_lines - total_staged}
+                "duplicate_checkpoints": total_staged - new_rows
+                - retransmitted,
+                "intra_batch_duplicates": n_lines - total_staged,
+                "retransmitted_evicted": retransmitted}
     finally:
         conn.close()
+
+
+def _check_evicted_retransmissions(conn):
+    """Compare staged revisions that only have a content receipt.
+
+    Returns None when every such retransmission is byte-equivalent to the
+    originally accepted payload, else a BatchError message naming the
+    first provenance.  Only rows without a live checkpoint row are
+    considered, so the cost is proportional to retransmissions of evicted
+    revisions, not to the size of the batch or the warehouse.
+    """
+    rows = conn.execute(
+        "SELECT s.region, s.collector, s.generation, s.ts, s.revision,"
+        "       s.cuts, s.counts, s.total, r.first_batch, r.first_line,"
+        "       r.first_version, r.content_sha256"
+        " FROM stage_dedup s JOIN receipt r"
+        " ON r.kind = 'content' AND r.region = s.region"
+        " AND r.collector = s.collector"
+        " AND r.generation = s.generation AND r.ts = s.ts"
+        " AND r.revision = s.revision"
+        " WHERE NOT EXISTS(SELECT 1 FROM checkpoint p WHERE "
+        + _KEY_JOIN + ")").fetchall()
+    for (region, collector, generation, ts, revision, cuts, counts, total,
+         first_batch, first_line, first_version, sha) in rows:
+        if payload_sha256(region, collector, generation, ts, revision,
+                          cuts, counts, total) != sha:
+            return (
+                "checkpoint region={!r} collector={!r} generation={!r} "
+                "ts={} revision={} conflicts with the revision first loaded"
+                " by batch {!r} line {} (warehouse version {}) whose"
+                " payload has since been retired".format(
+                    region, collector, generation, ts, revision,
+                    first_batch, first_line, first_version))
+    return None
 
 
 def list_batches(db_path) -> dict:

@@ -61,8 +61,11 @@ from collections import OrderedDict
 from datetime import datetime, timezone
 from typing import NamedTuple
 
-from .common import HistowareError, parse_duty, parse_shift, TOOL_VERSION
-from .warehouse import connect_warehouse, get_current_version
+from .common import (HistowareError, RetiredVersionError, parse_duty,
+                     parse_shift, TOOL_VERSION)
+from .warehouse import (connect_warehouse, get_current_version,
+                        is_managed, read_policy)
+from .retention import is_replayable, replay_intervals
 
 RESULT_SCHEMA_VERSION = "1"
 
@@ -487,6 +490,19 @@ def run_summary(db_path, version, roster_path, request_path, out_path):
                 raise SummaryError(
                     f"warehouse version {v} not available"
                     f" (current version {current})")
+            # Replay eligibility is decided from the *same* snapshot
+            # that will serve the endpoints, so a retirement approved
+            # mid-run cannot leave a summary reading a half-retired view.
+            managed = is_managed(wh)
+            retired_meta = None
+            if managed:
+                policy = read_policy(wh)
+                intervals = replay_intervals(
+                    policy["watermark"], policy["exceptions"], current)
+                if not is_replayable(intervals, v):
+                    raise RetiredVersionError(
+                        v, policy["watermark"], policy["policy_generation"])
+                retired_meta = policy
             tmp_out = f"{out_path}.tmp-{os.getpid()}"
             try:
                 os.unlink(tmp_out)
@@ -519,6 +535,11 @@ def run_summary(db_path, version, roster_path, request_path, out_path):
                     "created_utc": datetime.now(timezone.utc)
                     .isoformat(timespec="seconds"),
                 }
+                if retired_meta is not None:
+                    meta["retention_watermark"] = str(
+                        retired_meta["watermark"])
+                    meta["retention_policy_generation"] = str(
+                        retired_meta["policy_generation"])
                 for key, value in meta.items():
                     out.execute("INSERT INTO meta(key, value) VALUES (?,?)",
                                 (key, value))
