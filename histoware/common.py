@@ -19,7 +19,7 @@ from typing import NamedTuple
 MAX_COUNT = (1 << 64) - 1          # counts / totals may reach 2^64 - 1
 MAX_INT64 = (1 << 63) - 1          # ts / revision / cut points
 
-TOOL_VERSION = "1.0.0"
+TOOL_VERSION = "1.1.0"
 
 
 class HistowareError(Exception):
@@ -209,3 +209,28 @@ def parse_shift(raw, line_no: int) -> ShiftRequest:
         if type(cut) is not int or not (1 <= cut <= MAX_INT64):
             raise LineError(line_no, "query cut points must be integers in [1, 2^63-1]")
     return ShiftRequest(name, region, start, end, tuple(sorted(set(cuts))))
+
+
+class PairRequest(NamedTuple):
+    """One explicit baseline/candidate shift pairing to attribute.
+
+    Matching is by shift name and the exact cut point; names on the two
+    sides are never matched by order or similarity.
+    """
+    pair_id: str
+    baseline_shift: str
+    candidate_shift: str
+    cut_ms: int
+
+
+_PAIR_KEYS = {"id", "baseline_shift", "candidate_shift", "cut_ms"}
+
+
+def parse_pair(raw, line_no: int) -> PairRequest:
+    obj = load_json_object(raw, line_no)
+    _check_keys(obj, _PAIR_KEYS, line_no)
+    pair_id = _req_str(obj, "id", line_no)
+    baseline = _req_str(obj, "baseline_shift", line_no)
+    candidate = _req_str(obj, "candidate_shift", line_no)
+    cut = _req_int(obj, "cut_ms", line_no, 1, MAX_INT64)
+    return PairRequest(pair_id, baseline, candidate, cut)

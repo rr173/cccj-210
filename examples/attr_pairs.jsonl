@@ -1,0 +1,2 @@
+{"id":"week-over-week-10ms","baseline_shift":"base-week","candidate_shift":"cand-week","cut_ms":10}
+{"id":"week-over-week-50ms","baseline_shift":"base-week","candidate_shift":"cand-week","cut_ms":50}

@@ -7,6 +7,7 @@ import sqlite3
 import sys
 
 from .common import HistowareError
+from . import attribution as attribution_mod
 from . import summary as summary_mod
 from . import warehouse as warehouse_mod
 
@@ -38,6 +39,18 @@ def _build_parser():
     batches = sub.add_parser(
         "batches", help="list committed batches and versions")
     batches.add_argument("--db", required=True, help="warehouse SQLite path")
+
+    attr = sub.add_parser(
+        "attribute",
+        help="attribute a shift regression between two result databases")
+    attr.add_argument("--baseline", required=True,
+                      help="baseline shift summary result SQLite path")
+    attr.add_argument("--candidate", required=True,
+                      help="candidate shift summary result SQLite path")
+    attr.add_argument("--pairs", required=True,
+                      help="explicit pairing manifest JSONL")
+    attr.add_argument("--out", required=True,
+                      help="comparison SQLite path")
     return parser
 
 
@@ -59,6 +72,11 @@ def main(argv=None):
             print(json.dumps(stats, indent=2, sort_keys=True))
         elif args.command == "batches":
             print(json.dumps(warehouse_mod.list_batches(args.db), indent=2))
+        elif args.command == "attribute":
+            stats = attribution_mod.run_attribution(
+                args.baseline, args.candidate, args.pairs, args.out)
+            stats["out"] = args.out
+            print(json.dumps(stats, indent=2, sort_keys=True))
     except HistowareError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

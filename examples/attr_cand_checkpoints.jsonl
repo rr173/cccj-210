@@ -1,0 +1,6 @@
+{"region":"cn-1","collector":"a","generation":"g1","ts":1700090000,"revision":0,"cuts_ms":[10],"counts":[0],"total":0}
+{"region":"cn-1","collector":"a","generation":"g1","ts":1700093600,"revision":0,"cuts_ms":[10],"counts":[3],"total":12}
+{"region":"cn-1","collector":"b","generation":"g1","ts":1700090000,"revision":0,"cuts_ms":[10],"counts":[0],"total":0}
+{"region":"cn-1","collector":"b","generation":"g1","ts":1700093600,"revision":0,"cuts_ms":[5,20],"counts":[2,4],"total":10}
+{"region":"cn-1","collector":"c","generation":"g1","ts":1700090000,"revision":0,"cuts_ms":[10],"counts":[0],"total":0}
+{"region":"cn-1","collector":"c","generation":"g1","ts":1700093600,"revision":0,"cuts_ms":[10],"counts":[6],"total":8}
