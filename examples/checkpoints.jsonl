@@ -1,0 +1,4 @@
+{"region":"cn-1","collector":"a","generation":"g1","ts":1700000000,"revision":0,"cuts_ms":[10],"counts":[2],"total":3}
+{"region":"cn-1","collector":"a","generation":"g1","ts":1700003600,"revision":0,"cuts_ms":[20],"counts":[4],"total":7}
+{"region":"cn-1","collector":"b","generation":"g1","ts":1700000000,"revision":0,"cuts_ms":[10],"counts":[0],"total":0}
+{"region":"cn-1","collector":"b","generation":"g1","ts":1700003600,"revision":0,"cuts_ms":[10],"counts":[1],"total":1}
