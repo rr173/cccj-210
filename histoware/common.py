@@ -19,7 +19,7 @@ from typing import NamedTuple
 MAX_COUNT = (1 << 64) - 1          # counts / totals may reach 2^64 - 1
 MAX_INT64 = (1 << 63) - 1          # ts / revision / cut points
 
-TOOL_VERSION = "1.2.0"
+TOOL_VERSION = "1.3.0"
 
 
 class HistowareError(Exception):
@@ -184,7 +184,12 @@ _CHECKPOINT_KEYS = {
 
 
 def parse_checkpoint(raw, line_no: int) -> Checkpoint:
-    obj = load_json_object(raw, line_no)
+    return checkpoint_from_values(load_json_object(raw, line_no), line_no)
+
+
+def checkpoint_from_values(obj: dict, line_no: int) -> Checkpoint:
+    """Validate an already-parsed checkpoint object (exactly the eight
+    checkpoint keys) and return it in canonical form."""
     _check_keys(obj, _CHECKPOINT_KEYS, line_no)
     region = _req_str(obj, "region", line_no)
     collector = _req_str(obj, "collector", line_no)

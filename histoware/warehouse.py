@@ -120,6 +120,13 @@ CREATE UNIQUE INDEX IF NOT EXISTS ux_receipt_content
   WHERE kind = 'content';
 CREATE UNIQUE INDEX IF NOT EXISTS ux_receipt_plan
   ON receipt(plan_id) WHERE kind = 'retirement';
+-- Mirror exports (histoware.mirror) read one read-only snapshot and
+-- must not enumerate the whole warehouse per version: the delta export
+-- range-scans checkpoint rows by introducing version and looks batches
+-- up by version.  Both indexes are created once, here, for every
+-- warehouse opened with create=True; exports themselves stay read-only.
+CREATE INDEX IF NOT EXISTS ix_checkpoint_version ON checkpoint(version);
+CREATE INDEX IF NOT EXISTS ix_batch_version ON batch(version);
 """
 
 # Keys that mark a warehouse as explicitly managed.  Absence of
